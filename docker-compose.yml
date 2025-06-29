@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  snowflake-mcp:
+    build: .
+    image: snowflake-mcp-server:latest
+    container_name: snowflake-mcp-server
+    environment:
+      # Snowflake connection parameters
+      - SNOWFLAKE_ACCOUNT=${SNOWFLAKE_ACCOUNT}
+      - SNOWFLAKE_USER=${SNOWFLAKE_USER}
+      - SNOWFLAKE_PASSWORD=${SNOWFLAKE_PASSWORD}
+      - SNOWFLAKE_ROLE=${SNOWFLAKE_ROLE}
+      - SNOWFLAKE_WAREHOUSE=${SNOWFLAKE_WAREHOUSE}
+      - SNOWFLAKE_DATABASE=${SNOWFLAKE_DATABASE}
+      - SNOWFLAKE_SCHEMA=${SNOWFLAKE_SCHEMA}
+      # MCP server settings
+      - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
+      - ALLOW_WRITE=${ALLOW_WRITE:-false}
+    volumes:
+      - ./logs:/app/logs
+      - snowflake-mcp-config:/home/mcp/.snowflake-mcp
+    stdin_open: true
+    tty: true
+    networks:
+      - mcp-network
+
+volumes:
+  snowflake-mcp-config:
+    driver: local
+
+networks:
+  mcp-network:
+    driver: bridge

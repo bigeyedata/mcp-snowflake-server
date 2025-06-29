@@ -5,7 +5,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,20 +18,22 @@ COPY src/ src/
 # Install project dependencies
 RUN pip install --no-cache-dir .
 
+# Create a non-root user
+RUN useradd -m -u 1000 mcp && chown -R mcp:mcp /app
+
+# Create directories for logs and configuration
+RUN mkdir -p /home/mcp/.snowflake-mcp /app/logs && \
+    chown -R mcp:mcp /home/mcp/.snowflake-mcp /app/logs
+
+# Switch to non-root user
+USER mcp
+
 # Set environment variables
 ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 
-# Create a directory for logs
-RUN mkdir -p /app/logs
+# Expose the stdio interface
+EXPOSE 5000
 
-# Set the entrypoint to handle all arguments
-ENTRYPOINT ["mcp_snowflake_server"]
-
-# Default command (can be overridden)
-CMD ["--account", "your_account", \
-     "--warehouse", "your_warehouse", \
-     "--user", "your_user", \
-     "--password", "your_password", \
-     "--role", "your_role", \
-     "--database", "your_database", \
-     "--schema", "your_schema"] 
+# Default entrypoint - can be overridden
+ENTRYPOINT ["mcp_snowflake_server"] 
