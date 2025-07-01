@@ -459,7 +459,7 @@ async def read_query(query: str) -> Dict[str, Any]:
         }
     
     # Check if it's a read query
-    if not write_detector.is_read_query(query):
+    if write_detector.analyze_query(query)['contains_write']:
         return {
             'success': False,
             'error': 'Only SELECT queries are allowed. Use write_query for INSERT/UPDATE/DELETE operations.'
@@ -501,7 +501,7 @@ async def write_query(query: str) -> Dict[str, Any]:
         }
     
     # Check if it's a write query
-    if not write_detector.is_write_query(query):
+    if not write_detector.analyze_query(query)['contains_write']:
         return {
             'success': False,
             'error': 'Only INSERT, UPDATE, or DELETE queries are allowed here. Use read_query for SELECT operations.'
