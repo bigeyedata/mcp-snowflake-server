@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "snowflake": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "--name", "claude-snowflake-mcp",
+        "--platform", "linux/amd64",
+        "--mount", "type=bind,source=/Users/YOUR_USERNAME/.snowflake-mcp,target=/home/mcp/.snowflake-mcp",
+        "mcp-snowflake-server"
+      ]
+    }
+  }
+}

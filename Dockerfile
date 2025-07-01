@@ -9,14 +9,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy project files
-COPY pyproject.toml .
-COPY README.md .
-COPY runtime_config.json .
-COPY src/ src/
+# Copy requirements file if it exists, otherwise install dependencies directly
+COPY requirements.txt* ./
+RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; \
+    else pip install --no-cache-dir mcp snowflake-connector-python[pandas] snowflake-snowpark-python cryptography python-dotenv sqlparse; fi
 
-# Install project dependencies
-RUN pip install --no-cache-dir .
+# Copy application files
+COPY server.py .
+COPY config.py .
+COPY src/ src/
+COPY config.json* ./
 
 # Create a non-root user
 RUN useradd -m -u 1000 mcp && chown -R mcp:mcp /app
@@ -32,8 +34,5 @@ USER mcp
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Expose the stdio interface
-EXPOSE 5000
-
-# Default entrypoint - can be overridden
-ENTRYPOINT ["mcp_snowflake_server"] 
+# Default command - run the server directly
+CMD ["python", "server.py"] 

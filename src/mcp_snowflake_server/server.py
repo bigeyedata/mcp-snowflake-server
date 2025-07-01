@@ -12,6 +12,7 @@ from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from pydantic import AnyUrl, BaseModel
 
+from .auth import SnowflakeAuthClient
 from .db_client import SnowflakeDB
 from .write_detector import SQLWriteDetector
 
@@ -307,6 +308,162 @@ async def prefetch_tables(db: SnowflakeDB, credentials: dict) -> dict:
         return f"Error prefetching table descriptions: {e}"
 
 
+# Authentication handlers
+async def handle_authenticate_snowflake(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """Authenticate with Snowflake using connection parameters"""
+    if not arguments:
+        raise ValueError("Missing connection parameters")
+    
+    required_params = ['account', 'user', 'password']
+    missing = [p for p in required_params if p not in arguments]
+    if missing:
+        raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+    
+    # Build connection parameters
+    connection_params = {
+        'account': arguments['account'],
+        'user': arguments['user'], 
+        'password': arguments['password']
+    }
+    
+    # Add optional parameters
+    optional_params = ['warehouse', 'database', 'schema', 'role']
+    for param in optional_params:
+        if param in arguments:
+            connection_params[param] = arguments[param]
+    
+    # Test authentication
+    auth_result = auth_client.test_authentication(connection_params)
+    
+    if not auth_result.get('valid', False):
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Authentication failed: {auth_result.get('error', 'Unknown error')}"
+            )
+        ]
+    
+    # Set credentials in auth client
+    auth_client.set_credentials(connection_params)
+    
+    # Save if requested
+    if arguments.get('save_credentials', True):
+        auth_client.storage.save_credentials(
+            connection_params['account'],
+            connection_params['user'],
+            connection_params
+        )
+    
+    # Create and initialize the database connection
+    # This is passed by reference from main()
+    new_db = SnowflakeDB(connection_params)
+    new_db.start_init_connection()
+    
+    # Update the db reference in the main scope
+    # We'll need to pass this through kwargs
+    if 'db_setter' in kwargs:
+        kwargs['db_setter'](new_db)
+    
+    return [
+        types.TextContent(
+            type="text",
+            text=f"""Successfully authenticated to Snowflake:
+- Account: {auth_result['account']}
+- User: {auth_result['user']}
+- Role: {auth_result['role']}
+- Warehouse: {auth_result['warehouse']}
+- Credentials saved: {arguments.get('save_credentials', True)}"""
+        )
+    ]
+
+
+async def handle_use_saved_credentials(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """Use previously saved credentials"""
+    if not arguments or 'account' not in arguments or 'user' not in arguments:
+        raise ValueError("Missing required 'account' and 'user' parameters")
+    
+    connection_params = auth_client.storage.get_credentials(
+        arguments['account'],
+        arguments['user']
+    )
+    
+    if not connection_params:
+        return [
+            types.TextContent(
+                type="text",
+                text=f"No saved credentials found for account '{arguments['account']}' and user '{arguments['user']}'"
+            )
+        ]
+    
+    # Test that credentials still work
+    auth_result = auth_client.test_authentication(connection_params)
+    
+    if auth_result['valid']:
+        auth_client.set_credentials(connection_params)
+        
+        # Create and initialize the database connection
+        new_db = SnowflakeDB(connection_params)
+        new_db.start_init_connection()
+        
+        # Update the db reference in the main scope
+        if 'db_setter' in kwargs:
+            kwargs['db_setter'](new_db)
+        
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Connected to Snowflake account '{arguments['account']}' as user '{arguments['user']}'"
+            )
+        ]
+    else:
+        return [
+            types.TextContent(
+                type="text",
+                text="Saved credentials are no longer valid. Please authenticate again."
+            )
+        ]
+
+
+async def handle_list_saved_credentials(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """List all saved credentials"""
+    saved = auth_client.storage.list_saved_credentials()
+    
+    if not saved:
+        return [
+            types.TextContent(
+                type="text",
+                text="No saved credentials found."
+            )
+        ]
+    
+    output = "Saved Snowflake credentials:\n\n"
+    for account, users in saved.items():
+        output += f"Account: {account}\n"
+        for user in users:
+            output += f"  - User: {user}\n"
+    
+    return [types.TextContent(type="text", text=output)]
+
+
+async def handle_delete_saved_credentials(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """Delete saved credentials"""
+    account = arguments.get('account') if arguments else None
+    user = arguments.get('user') if arguments else None
+    
+    auth_client.storage.delete_credentials(account, user)
+    
+    if not account and not user:
+        message = "All saved credentials have been deleted."
+    elif account and user:
+        message = f"Deleted credentials for account '{account}' and user '{user}'."
+    elif account:
+        message = f"Deleted all credentials for account '{account}'."
+    else:
+        message = "Invalid parameters for credential deletion."
+    
+    return [types.TextContent(type="text", text=message)]
+
+
 async def main(
     allow_write: bool = False,
     connection_args: dict = None,
@@ -316,6 +473,7 @@ async def main(
     exclude_tools: list[str] = [],
     config_file: str = "runtime_config.json",
     exclude_patterns: dict = None,
+    connection_config_file: str = "config.json",
 ):
     # Setup logging
     if log_dir:
@@ -361,13 +519,51 @@ async def main(
 
     logger.info(f"Exclusion patterns: {exclusion_config}")
 
-    db = SnowflakeDB(connection_args)
-    db.start_init_connection()
+    # Initialize authentication client
+    auth_client = SnowflakeAuthClient()
+    db = None
+    
+    # Create a reference holder for db that can be updated
+    db_ref = {'db': None}
+    
+    def set_db(new_db):
+        nonlocal db
+        db = new_db
+        db_ref['db'] = new_db
+    
+    # First, try to load connection config from file
+    connection_config = None
+    if connection_config_file and os.path.exists(connection_config_file):
+        try:
+            with open(connection_config_file, 'r') as f:
+                connection_config = json.load(f)
+                logger.info(f"Loaded connection configuration from {connection_config_file}")
+                # Merge with any command-line args
+                if connection_args:
+                    connection_config.update(connection_args)
+                connection_args = connection_config
+        except Exception as e:
+            logger.error(f"Error loading connection config file: {e}")
+    
+    # Check if we have pre-configured credentials
+    if connection_args and all(k in connection_args for k in ['account', 'user', 'password']):
+        # Use config-based authentication
+        logger.info("Using pre-configured authentication")
+        auth_client.set_credentials(connection_args)
+        db = SnowflakeDB(connection_args)
+        db.start_init_connection()
+    else:
+        # Dynamic authentication mode
+        logger.info("Starting in dynamic authentication mode")
+        logger.info("No valid credentials found. Use 'authenticate_snowflake' tool to connect.")
+        # Create a placeholder DB that will be initialized after authentication
+        db = None
+    
     server = Server("snowflake-manager")
     write_detector = SQLWriteDetector()
 
-    tables_info = (await prefetch_tables(db, connection_args)) if prefetch else {}
-    tables_brief = data_to_yaml(tables_info) if prefetch else ""
+    tables_info = (await prefetch_tables(db, connection_args)) if (prefetch and db) else {}
+    tables_brief = data_to_yaml(tables_info) if (prefetch and db) else ""
 
     all_tools = [
         Tool(
@@ -471,6 +667,107 @@ async def main(
             tags=["write"],
         ),
     ]
+    
+    # Add authentication tools
+    auth_tools = [
+        Tool(
+            name="authenticate_snowflake",
+            description="Authenticate with Snowflake using connection parameters",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Snowflake account identifier (e.g., 'myorg-myaccount' or 'myaccount.region')"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Snowflake username"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Snowflake password"
+                    },
+                    "warehouse": {
+                        "type": "string",
+                        "description": "Warehouse to use (optional)"
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Default database (optional)"
+                    },
+                    "schema": {
+                        "type": "string",
+                        "description": "Default schema (optional)"
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role to use (optional)"
+                    },
+                    "save_credentials": {
+                        "type": "boolean",
+                        "description": "Whether to save credentials for future use (default: true)",
+                        "default": True
+                    }
+                },
+                "required": ["account", "user", "password"]
+            },
+            handler=handle_authenticate_snowflake,
+            tags=["auth"]
+        ),
+        Tool(
+            name="use_saved_credentials",
+            description="Use previously saved Snowflake credentials",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Snowflake account identifier"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Snowflake username"
+                    }
+                },
+                "required": ["account", "user"]
+            },
+            handler=handle_use_saved_credentials,
+            tags=["auth"]
+        ),
+        Tool(
+            name="list_saved_credentials",
+            description="List all saved Snowflake credentials",
+            input_schema={
+                "type": "object",
+                "properties": {}
+            },
+            handler=handle_list_saved_credentials,
+            tags=["auth"]
+        ),
+        Tool(
+            name="delete_saved_credentials",
+            description="Delete saved Snowflake credentials",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Snowflake account identifier (optional, deletes all if not specified)"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Snowflake username (optional)"
+                    }
+                }
+            },
+            handler=handle_delete_saved_credentials,
+            tags=["auth"]
+        )
+    ]
+    
+    # Combine all tools
+    all_tools = auth_tools + all_tools
 
     exclude_tags = []
     if not allow_write:
@@ -485,6 +782,12 @@ async def main(
     @server.list_resources()
     async def handle_list_resources() -> list[types.Resource]:
         resources = [
+            types.Resource(
+                uri=AnyUrl("snowflake://auth/status"),
+                name="Authentication Status",
+                description="Current Snowflake authentication status",
+                mimeType="text/plain",
+            ),
             types.Resource(
                 uri=AnyUrl("memo://insights"),
                 name="Data Insights Memo",
@@ -506,8 +809,28 @@ async def main(
 
     @server.read_resource()
     async def handle_read_resource(uri: AnyUrl) -> str:
-        if str(uri) == "memo://insights":
-            return db.get_memo()
+        if str(uri) == "snowflake://auth/status":
+            if auth_client.is_authenticated:
+                return f"""Authenticated to Snowflake:
+- Account: {auth_client.current_connection_params.get('account', 'N/A')}
+- User: {auth_client.current_connection_params.get('user', 'N/A')}
+- Warehouse: {auth_client.current_connection_params.get('warehouse', 'Default')}
+- Database: {auth_client.current_connection_params.get('database', 'Not set')}
+- Schema: {auth_client.current_connection_params.get('schema', 'Not set')}
+- Status: ✓ Connected"""
+            else:
+                saved = auth_client.storage.list_saved_credentials()
+                if saved:
+                    return f"""Not authenticated. Saved credentials available for:
+{json.dumps(saved, indent=2)}
+
+Use 'authenticate_snowflake' tool to connect."""
+                else:
+                    return """Not authenticated to Snowflake.
+
+Use 'authenticate_snowflake' tool with your credentials to connect."""
+        elif str(uri) == "memo://insights":
+            return db.get_memo() if db else "Database not initialized. Please authenticate first."
         elif str(uri).startswith("context://table"):
             table_name = str(uri).split("/")[-1]
             if table_name in tables_info:
@@ -537,8 +860,24 @@ async def main(
         if not handler:
             raise ValueError(f"Unknown tool: {name}")
 
-        # Pass exclusion_config to the handler if it's a listing function
-        if name in ["list_databases", "list_schemas", "list_tables"]:
+        # Check if db is None for non-auth tools
+        if db is None and name not in ["authenticate_snowflake", "use_saved_credentials", "list_saved_credentials", "delete_saved_credentials"]:
+            return [types.TextContent(type="text", text="Not authenticated. Please use 'authenticate_snowflake' tool first.")]
+        
+        # Pass appropriate parameters based on tool type
+        if name in ["authenticate_snowflake", "use_saved_credentials", "list_saved_credentials", "delete_saved_credentials"]:
+            # Authentication tools
+            return await handler(
+                arguments,
+                db,
+                write_detector,
+                allow_write,
+                server,
+                auth_client=auth_client,
+                db_setter=set_db
+            )
+        elif name in ["list_databases", "list_schemas", "list_tables"]:
+            # Listing functions with exclusion config
             return await handler(
                 arguments,
                 db,
@@ -548,6 +887,7 @@ async def main(
                 exclusion_config=exclusion_config,
             )
         else:
+            # Other tools
             return await handler(arguments, db, write_detector, allow_write, server)
 
     @server.list_tools()

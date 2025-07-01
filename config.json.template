@@ -1,0 +1,9 @@
+{
+  "account": "your-account-identifier",
+  "user": "your-username",
+  "password": "your-password",
+  "warehouse": "your-warehouse",
+  "database": "your-database",
+  "schema": "your-schema",
+  "role": "your-role"
+}
