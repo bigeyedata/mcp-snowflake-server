@@ -357,7 +357,7 @@ async def handle_authenticate_snowflake(arguments, db, _, __, server, auth_clien
     # Create and initialize the database connection
     # This is passed by reference from main()
     new_db = SnowflakeDB(connection_params)
-    new_db.start_init_connection()
+    await new_db.start_init_connection()
     
     # Update the db reference in the main scope
     # We'll need to pass this through kwargs
@@ -403,7 +403,7 @@ async def handle_use_saved_credentials(arguments, db, _, __, server, auth_client
         
         # Create and initialize the database connection
         new_db = SnowflakeDB(connection_params)
-        new_db.start_init_connection()
+        await new_db.start_init_connection()
         
         # Update the db reference in the main scope
         if 'db_setter' in kwargs:
@@ -551,7 +551,7 @@ async def main(
         logger.info("Using pre-configured authentication")
         auth_client.set_credentials(connection_args)
         db = SnowflakeDB(connection_args)
-        db.start_init_connection()
+        await db.start_init_connection()
     else:
         # Dynamic authentication mode
         logger.info("Starting in dynamic authentication mode")

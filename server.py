@@ -101,7 +101,7 @@ if config.get("account") and config.get("user") and config.get("password"):
     }
     auth_client.set_credentials(connection_params)
     db = SnowflakeDB(connection_params)
-    db.start_init_connection()
+    # Note: We'll initialize the connection on first use since we can't await here
 else:
     debug_print("Starting in dynamic authentication mode")
 
@@ -192,7 +192,7 @@ async def authenticate_snowflake(
     
     # Create and initialize database connection
     db = SnowflakeDB(connection_params)
-    db.start_init_connection()
+    await db.start_init_connection()
     
     return {
         'success': True,
@@ -230,7 +230,7 @@ async def use_saved_credentials(
         
         # Create and initialize database connection
         db = SnowflakeDB(connection_params)
-        db.start_init_connection()
+        await db.start_init_connection()
         
         return {
             'success': True,

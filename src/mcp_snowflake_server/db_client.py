@@ -39,11 +39,10 @@ class SnowflakeDB:
         except Exception as e:
             raise ValueError(f"Failed to connect to Snowflake database: {e}")
 
-    def start_init_connection(self):
+    async def start_init_connection(self):
         """Start database initialization in the background"""
         # Create a task that runs in the background
-        loop = asyncio.get_event_loop()
-        self.init_task = loop.create_task(self._init_database())
+        self.init_task = asyncio.create_task(self._init_database())
         return self.init_task
 
     async def execute_query(self, query: str) -> tuple[list[dict[str, Any]], str]:
@@ -57,10 +56,29 @@ class SnowflakeDB:
 
         logger.debug(f"Executing query: {query}")
         try:
-            result = self.session.sql(query).to_pandas()
-            result_rows = result.to_dict(orient="records")
+            # Determine if this is a SELECT query or other statement
+            query_upper = query.strip().upper()
+            is_select = query_upper.startswith('SELECT')
+            
+            if is_select:
+                # For SELECT queries, use to_pandas()
+                result = self.session.sql(query).to_pandas()
+                result_rows = result.to_dict(orient="records")
+            else:
+                # For non-SELECT queries (SHOW, DESCRIBE, etc.), use collect()
+                rows = self.session.sql(query).collect()
+                
+                # Convert Row objects to dictionaries
+                result_rows = []
+                for row in rows:
+                    # Convert Row to dict - Row objects have as_dict() method
+                    if hasattr(row, 'as_dict'):
+                        result_rows.append(row.as_dict())
+                    else:
+                        # Fallback: convert using dict comprehension
+                        result_rows.append({col: getattr(row, col) for col in row._fields if hasattr(row, col)})
+            
             data_id = str(uuid.uuid4())
-
             return result_rows, data_id
 
         except Exception as e:
