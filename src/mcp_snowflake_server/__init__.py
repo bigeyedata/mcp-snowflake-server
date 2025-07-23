@@ -5,7 +5,7 @@ import os
 import dotenv
 import snowflake.connector
 
-from . import server
+# Note: server module has been deprecated - use the root server.py file instead
 
 
 def parse_args():
@@ -93,20 +93,15 @@ def main():
         "schema" in connection_args
     ), 'You must provide the username as "--schema" argument or "SNOWFLAKE_SCHEMA" environment variable.'
 
-    asyncio.run(
-        server.main(
-            connection_args=connection_args,
-            allow_write=server_args["allow_write"],
-            log_dir=server_args["log_dir"],
-            prefetch=server_args["prefetch"],
-            log_level=server_args["log_level"],
-            exclude_tools=server_args["exclude_tools"],
-        )
+    # This functionality has been moved to the root server.py file
+    raise NotImplementedError(
+        "This module's functionality has been deprecated. "
+        "Please run the server.py file at the root of the project instead."
     )
 
 
 # Optionally expose other important items at package level
-__all__ = ["main", "server", "write_detector"]
+__all__ = ["main", "write_detector"]
 
 if __name__ == "__main__":
     main()

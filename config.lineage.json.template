@@ -1,0 +1,15 @@
+{
+  "account": "your-snowflake-account",
+  "user": "your-username",
+  "password": "your-password",
+  "warehouse": "COMPUTE_WH",
+  "database": "MYDB",
+  "schema": "PUBLIC",
+  "role": "SYSADMIN",
+  "debug": false,
+  "allow_write": false,
+  "enable_lineage_tracking": true,
+  "bigeye_api_url": "https://app.bigeye.com",
+  "bigeye_api_key": "your-bigeye-api-key",
+  "agent_name": "AI Agent - Claude"
+}

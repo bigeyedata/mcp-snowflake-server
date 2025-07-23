@@ -1,0 +1,1743 @@
+import importlib.metadata
+import json
+import logging
+import os
+from functools import wraps
+from typing import Any, Callable
+
+import mcp.server.stdio
+import mcp.types as types
+import yaml
+from mcp.server import NotificationOptions, Server
+from mcp.server.models import InitializationOptions
+from pydantic import AnyUrl, BaseModel
+
+from .auth import SnowflakeAuthClient
+from .db_client import SnowflakeDB
+from .write_detector import SQLWriteDetector
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger("mcp_snowflake_server")
+
+
+def data_to_yaml(data: Any) -> str:
+    return yaml.dump(data, indent=2, sort_keys=False)
+
+# Custom serializer that checks for 'date' type
+def data_json_serializer(obj):
+    from datetime import date, datetime
+    if isinstance(obj, date) or isinstance(obj, datetime):
+        return obj.isoformat()
+    else:
+        return obj
+
+
+def handle_tool_errors(func: Callable) -> Callable:
+    """Decorator to standardize tool error handling"""
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs) -> list[types.TextContent]:
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {str(e)}")
+            return [types.TextContent(type="text", text=f"Error: {str(e)}")]
+
+    return wrapper
+
+
+class Tool(BaseModel):
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: Callable[
+        [str, dict[str, Any] | None],
+        list[types.TextContent | types.ImageContent | types.EmbeddedResource],
+    ]
+    tags: list[str] = []
+
+
+# Tool handlers
+async def handle_list_databases(arguments, db, *_, exclusion_config=None):
+    query = "SELECT DATABASE_NAME FROM INFORMATION_SCHEMA.DATABASES"
+    data, data_id = await db.execute_query(query)
+
+    # Filter out excluded databases
+    if exclusion_config and "databases" in exclusion_config and exclusion_config["databases"]:
+        filtered_data = []
+        for item in data:
+            db_name = item.get("DATABASE_NAME", "")
+            exclude = False
+            for pattern in exclusion_config["databases"]:
+                if pattern.lower() in db_name.lower():
+                    exclude = True
+                    break
+            if not exclude:
+                filtered_data.append(item)
+        data = filtered_data
+
+    output = {
+        "type": "data",
+        "data_id": data_id,
+        "data": data,
+    }
+    yaml_output = data_to_yaml(output)
+    json_output = json.dumps(output)
+    return [
+        types.TextContent(type="text", text=yaml_output),
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.TextResourceContents(uri=f"data://{data_id}", text=json_output, mimeType="application/json"),
+        ),
+    ]
+
+
+async def handle_list_schemas(arguments, db, *_, exclusion_config=None):
+    if not arguments or "database" not in arguments:
+        raise ValueError("Missing required 'database' parameter")
+
+    database = arguments["database"]
+    query = f"SELECT SCHEMA_NAME FROM {database.upper()}.INFORMATION_SCHEMA.SCHEMATA"
+    data, data_id = await db.execute_query(query)
+
+    # Filter out excluded schemas
+    if exclusion_config and "schemas" in exclusion_config and exclusion_config["schemas"]:
+        filtered_data = []
+        for item in data:
+            schema_name = item.get("SCHEMA_NAME", "")
+            exclude = False
+            for pattern in exclusion_config["schemas"]:
+                if pattern.lower() in schema_name.lower():
+                    exclude = True
+                    break
+            if not exclude:
+                filtered_data.append(item)
+        data = filtered_data
+
+    output = {
+        "type": "data",
+        "data_id": data_id,
+        "database": database,
+        "data": data,
+    }
+    yaml_output = data_to_yaml(output)
+    json_output = json.dumps(output)
+    return [
+        types.TextContent(type="text", text=yaml_output),
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.TextResourceContents(uri=f"data://{data_id}", text=json_output, mimeType="application/json"),
+        ),
+    ]
+
+
+async def handle_list_tables(arguments, db, *_, exclusion_config=None):
+    if not arguments or "database" not in arguments or "schema" not in arguments:
+        raise ValueError("Missing required 'database' and 'schema' parameters")
+
+    database = arguments["database"]
+    schema = arguments["schema"]
+
+    query = f"""
+        SELECT table_catalog, table_schema, table_name, comment 
+        FROM {database}.information_schema.tables 
+        WHERE table_schema = '{schema.upper()}'
+    """
+    data, data_id = await db.execute_query(query)
+
+    # Filter out excluded tables
+    if exclusion_config and "tables" in exclusion_config and exclusion_config["tables"]:
+        filtered_data = []
+        for item in data:
+            table_name = item.get("TABLE_NAME", "")
+            exclude = False
+            for pattern in exclusion_config["tables"]:
+                if pattern.lower() in table_name.lower():
+                    exclude = True
+                    break
+            if not exclude:
+                filtered_data.append(item)
+        data = filtered_data
+
+    output = {
+        "type": "data",
+        "data_id": data_id,
+        "database": database,
+        "schema": schema,
+        "data": data,
+    }
+    yaml_output = data_to_yaml(output)
+    json_output = json.dumps(output)
+    return [
+        types.TextContent(type="text", text=yaml_output),
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.TextResourceContents(uri=f"data://{data_id}", text=json_output, mimeType="application/json"),
+        ),
+    ]
+
+
+async def handle_describe_table(arguments, db, *_):
+    if not arguments or "table_name" not in arguments:
+        raise ValueError("Missing table_name argument")
+
+    table_spec = arguments["table_name"]
+    split_identifier = table_spec.split(".")
+
+    # Parse the fully qualified table name
+    if len(split_identifier) < 3:
+        raise ValueError("Table name must be fully qualified as 'database.schema.table'")
+
+    database_name = split_identifier[0].upper()
+    schema_name = split_identifier[1].upper()
+    table_name = split_identifier[2].upper()
+
+    query = f"""
+        SELECT column_name, column_default, is_nullable, data_type, comment 
+        FROM {database_name}.information_schema.columns 
+        WHERE table_schema = '{schema_name}' AND table_name = '{table_name}'
+    """
+    data, data_id = await db.execute_query(query)
+
+    output = {
+        "type": "data",
+        "data_id": data_id,
+        "database": database_name,
+        "schema": schema_name,
+        "table": table_name,
+        "data": data,
+    }
+    yaml_output = data_to_yaml(output)
+    json_output = json.dumps(output)
+    return [
+        types.TextContent(type="text", text=yaml_output),
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.TextResourceContents(uri=f"data://{data_id}", text=json_output, mimeType="application/json"),
+        ),
+    ]
+
+
+async def handle_read_query(arguments, db, write_detector, *_):
+    if not arguments or "query" not in arguments:
+        raise ValueError("Missing query argument")
+
+    if write_detector.analyze_query(arguments["query"])["contains_write"]:
+        raise ValueError("Calls to read_query should not contain write operations")
+
+    data, data_id = await db.execute_query(arguments["query"])
+
+    output = {
+        "type": "data",
+        "data_id": data_id,
+        "data": data,
+    }
+    yaml_output = data_to_yaml(output)
+    json_output = json.dumps(output, default=data_json_serializer)
+    return [
+        types.TextContent(type="text", text=yaml_output),
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.TextResourceContents(uri=f"data://{data_id}", text=json_output, mimeType="application/json"),
+        ),
+    ]
+
+
+async def handle_profile_table(arguments, db, _, __, server):
+    """Profile a table to get statistics and sample data."""
+    if not arguments or "table_name" not in arguments:
+        raise ValueError("Missing table_name argument")
+    
+    table_name = arguments["table_name"]
+    
+    # Basic table info query
+    row_count_query = f"SELECT COUNT(*) as row_count FROM {table_name}"
+    row_count_result, _ = await db.execute_query(row_count_query)
+    row_count = row_count_result[0]["ROW_COUNT"] if row_count_result else 0
+    
+    # Get column information with statistics
+    profile_query = f"""
+    SELECT 
+        COLUMN_NAME,
+        DATA_TYPE,
+        IS_NULLABLE,
+        COLUMN_DEFAULT,
+        COMMENT
+    FROM TABLE(INFORMATION_SCHEMA.COLUMNS)
+    WHERE TABLE_NAME = SPLIT_PART('{table_name}', '.', -1)
+    AND TABLE_SCHEMA = SPLIT_PART('{table_name}', '.', -2)
+    AND TABLE_CATALOG = SPLIT_PART('{table_name}', '.', -3)
+    """
+    
+    columns_info, _ = await db.execute_query(profile_query)
+    
+    # Get statistics for each column
+    column_stats = []
+    for col in columns_info:
+        col_name = col["COLUMN_NAME"]
+        stats = {
+            "column_name": col_name,
+            "data_type": col["DATA_TYPE"],
+            "nullable": col["IS_NULLABLE"] == "YES",
+            "default": col["COLUMN_DEFAULT"],
+            "comment": col["COMMENT"]
+        }
+        
+        # Get additional statistics based on data type
+        if "NUMBER" in col["DATA_TYPE"] or "INT" in col["DATA_TYPE"] or "FLOAT" in col["DATA_TYPE"]:
+            # Numeric column statistics
+            stats_query = f"""
+            SELECT 
+                MIN({col_name}) as min_value,
+                MAX({col_name}) as max_value,
+                AVG({col_name}) as avg_value,
+                MEDIAN({col_name}) as median_value,
+                COUNT(DISTINCT {col_name}) as distinct_count,
+                COUNT(CASE WHEN {col_name} IS NULL THEN 1 END) as null_count
+            FROM {table_name}
+            """
+            stats_result, _ = await db.execute_query(stats_query)
+            if stats_result:
+                stats.update({
+                    "min": stats_result[0]["MIN_VALUE"],
+                    "max": stats_result[0]["MAX_VALUE"],
+                    "avg": stats_result[0]["AVG_VALUE"],
+                    "median": stats_result[0]["MEDIAN_VALUE"],
+                    "distinct_count": stats_result[0]["DISTINCT_COUNT"],
+                    "null_count": stats_result[0]["NULL_COUNT"],
+                    "null_percentage": (stats_result[0]["NULL_COUNT"] / row_count * 100) if row_count > 0 else 0
+                })
+        else:
+            # String/other column statistics
+            stats_query = f"""
+            SELECT 
+                COUNT(DISTINCT {col_name}) as distinct_count,
+                COUNT(CASE WHEN {col_name} IS NULL THEN 1 END) as null_count,
+                MIN(LENGTH({col_name})) as min_length,
+                MAX(LENGTH({col_name})) as max_length,
+                AVG(LENGTH({col_name})) as avg_length
+            FROM {table_name}
+            """
+            stats_result, _ = await db.execute_query(stats_query)
+            if stats_result:
+                stats.update({
+                    "distinct_count": stats_result[0]["DISTINCT_COUNT"],
+                    "null_count": stats_result[0]["NULL_COUNT"],
+                    "null_percentage": (stats_result[0]["NULL_COUNT"] / row_count * 100) if row_count > 0 else 0,
+                    "min_length": stats_result[0]["MIN_LENGTH"],
+                    "max_length": stats_result[0]["MAX_LENGTH"],
+                    "avg_length": stats_result[0]["AVG_LENGTH"]
+                })
+        
+        # Get top 5 most frequent values
+        if stats.get("distinct_count", 0) < 1000:  # Only for low cardinality columns
+            top_values_query = f"""
+            SELECT 
+                {col_name} as value,
+                COUNT(*) as frequency
+            FROM {table_name}
+            WHERE {col_name} IS NOT NULL
+            GROUP BY {col_name}
+            ORDER BY frequency DESC
+            LIMIT 5
+            """
+            top_values_result, _ = await db.execute_query(top_values_query)
+            stats["top_values"] = [
+                {"value": str(r["VALUE"]), "frequency": r["FREQUENCY"]} 
+                for r in top_values_result
+            ]
+        
+        column_stats.append(stats)
+    
+    profile_result = {
+        "table_name": table_name,
+        "row_count": row_count,
+        "column_count": len(columns_info),
+        "columns": column_stats
+    }
+    
+    return [types.TextContent(
+        type="text", 
+        text=json.dumps(profile_result, indent=2)
+    )]
+
+
+async def handle_get_sample_data(arguments, db, _, __, server):
+    """Get sample data from a table."""
+    if not arguments or "table_name" not in arguments:
+        raise ValueError("Missing table_name argument")
+    
+    table_name = arguments["table_name"]
+    sample_size = arguments.get("sample_size", 10)
+    sample_method = arguments.get("sample_method", "top")  # "top", "random", or "bottom"
+    columns = arguments.get("columns", [])  # Optional column subset
+    
+    # Build column list
+    column_list = ", ".join(columns) if columns else "*"
+    
+    # Build query based on sample method
+    if sample_method == "random":
+        query = f"""
+        SELECT {column_list}
+        FROM {table_name}
+        SAMPLE ({sample_size} ROWS)
+        """
+    elif sample_method == "bottom":
+        query = f"""
+        SELECT {column_list}
+        FROM (
+            SELECT *
+            FROM {table_name}
+            ORDER BY 1 DESC
+            LIMIT {sample_size}
+        )
+        ORDER BY 1
+        """
+    else:  # default to "top"
+        query = f"""
+        SELECT {column_list}
+        FROM {table_name}
+        LIMIT {sample_size}
+        """
+    
+    # Execute query
+    sample_data, data_id = await db.execute_query(query)
+    
+    # Also get total row count for context
+    count_query = f"SELECT COUNT(*) as total_rows FROM {table_name}"
+    count_result, _ = await db.execute_query(count_query)
+    total_rows = count_result[0]["TOTAL_ROWS"] if count_result else 0
+    
+    result = {
+        "table_name": table_name,
+        "total_rows": total_rows,
+        "sample_size": len(sample_data),
+        "sample_method": sample_method,
+        "columns": columns if columns else "all",
+        "data": sample_data,
+        "data_id": data_id
+    }
+    
+    return [types.TextContent(
+        type="text",
+        text=json.dumps(result, indent=2)
+    )]
+
+
+async def handle_search_tables(arguments, db, _, __, server):
+    """Search for tables by name pattern or column name."""
+    search_pattern = arguments.get("search_pattern", "")
+    search_type = arguments.get("search_type", "table_name")  # "table_name", "column_name", or "comment"
+    database = arguments.get("database")  # Optional database filter
+    schema = arguments.get("schema")  # Optional schema filter
+    
+    if not search_pattern:
+        raise ValueError("search_pattern is required")
+    
+    # Build the base query based on search type
+    if search_type == "column_name":
+        # Search for tables containing a specific column
+        query = f"""
+        SELECT DISTINCT 
+            c.TABLE_CATALOG as DATABASE_NAME,
+            c.TABLE_SCHEMA as SCHEMA_NAME,
+            c.TABLE_NAME,
+            t.COMMENT as TABLE_COMMENT,
+            t.ROW_COUNT,
+            t.BYTES,
+            ARRAY_AGG(c.COLUMN_NAME) as MATCHING_COLUMNS
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        JOIN INFORMATION_SCHEMA.TABLES t 
+            ON c.TABLE_CATALOG = t.TABLE_CATALOG 
+            AND c.TABLE_SCHEMA = t.TABLE_SCHEMA 
+            AND c.TABLE_NAME = t.TABLE_NAME
+        WHERE UPPER(c.COLUMN_NAME) LIKE UPPER('%{search_pattern}%')
+        """
+    elif search_type == "comment":
+        # Search in table comments
+        query = f"""
+        SELECT 
+            TABLE_CATALOG as DATABASE_NAME,
+            TABLE_SCHEMA as SCHEMA_NAME,
+            TABLE_NAME,
+            COMMENT as TABLE_COMMENT,
+            ROW_COUNT,
+            BYTES
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE UPPER(COMMENT) LIKE UPPER('%{search_pattern}%')
+        """
+    else:  # default to table_name search
+        query = f"""
+        SELECT 
+            TABLE_CATALOG as DATABASE_NAME,
+            TABLE_SCHEMA as SCHEMA_NAME,
+            TABLE_NAME,
+            COMMENT as TABLE_COMMENT,
+            ROW_COUNT,
+            BYTES
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE UPPER(TABLE_NAME) LIKE UPPER('%{search_pattern}%')
+        """
+    
+    # Add database filter if provided
+    if database:
+        query += f"\nAND TABLE_CATALOG = '{database}'"
+    
+    # Add schema filter if provided
+    if schema:
+        query += f"\nAND TABLE_SCHEMA = '{schema}'"
+    
+    # Add grouping for column search
+    if search_type == "column_name":
+        query += "\nGROUP BY c.TABLE_CATALOG, c.TABLE_SCHEMA, c.TABLE_NAME, t.COMMENT, t.ROW_COUNT, t.BYTES"
+    
+    # Add ordering
+    query += "\nORDER BY DATABASE_NAME, SCHEMA_NAME, TABLE_NAME"
+    
+    # Execute the search
+    results, _ = await db.execute_query(query)
+    
+    # Format results
+    formatted_results = []
+    for row in results:
+        result = {
+            "database": row["DATABASE_NAME"],
+            "schema": row["SCHEMA_NAME"],
+            "table": row["TABLE_NAME"],
+            "full_name": f"{row['DATABASE_NAME']}.{row['SCHEMA_NAME']}.{row['TABLE_NAME']}",
+            "comment": row.get("TABLE_COMMENT", ""),
+            "row_count": row.get("ROW_COUNT", 0),
+            "size_bytes": row.get("BYTES", 0)
+        }
+        
+        # Add matching columns for column search
+        if search_type == "column_name" and "MATCHING_COLUMNS" in row:
+            result["matching_columns"] = row["MATCHING_COLUMNS"]
+        
+        formatted_results.append(result)
+    
+    return [types.TextContent(
+        type="text",
+        text=json.dumps({
+            "search_pattern": search_pattern,
+            "search_type": search_type,
+            "database_filter": database,
+            "schema_filter": schema,
+            "results_count": len(formatted_results),
+            "results": formatted_results
+        }, indent=2)
+    )]
+
+
+async def handle_get_table_relationships(arguments, db, _, __, server):
+    """Get foreign key relationships for a table."""
+    table_name = arguments.get("table_name")
+    
+    if not table_name:
+        raise ValueError("table_name is required")
+    
+    # Parse table name
+    parts = table_name.split(".")
+    if len(parts) == 3:
+        db_name, schema_name, table = parts
+    else:
+        raise ValueError("table_name must be in format 'database.schema.table'")
+    
+    # Query for foreign key constraints
+    fk_query = f"""
+    SELECT 
+        fk.CONSTRAINT_NAME,
+        fk.TABLE_CATALOG as FK_DATABASE,
+        fk.TABLE_SCHEMA as FK_SCHEMA,
+        fk.TABLE_NAME as FK_TABLE,
+        fk.COLUMN_NAME as FK_COLUMN,
+        pk.TABLE_CATALOG as PK_DATABASE,
+        pk.TABLE_SCHEMA as PK_SCHEMA,
+        pk.TABLE_NAME as PK_TABLE,
+        pk.COLUMN_NAME as PK_COLUMN
+    FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+    JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+        ON rc.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
+        AND rc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+        AND rc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
+        ON rc.CONSTRAINT_CATALOG = fk.CONSTRAINT_CATALOG
+        AND rc.CONSTRAINT_SCHEMA = fk.CONSTRAINT_SCHEMA
+        AND rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
+    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE pk
+        ON rc.UNIQUE_CONSTRAINT_CATALOG = pk.CONSTRAINT_CATALOG
+        AND rc.UNIQUE_CONSTRAINT_SCHEMA = pk.CONSTRAINT_SCHEMA
+        AND rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
+    WHERE (fk.TABLE_CATALOG = '{db_name}' AND fk.TABLE_SCHEMA = '{schema_name}' AND fk.TABLE_NAME = '{table}')
+       OR (pk.TABLE_CATALOG = '{db_name}' AND pk.TABLE_SCHEMA = '{schema_name}' AND pk.TABLE_NAME = '{table}')
+    ORDER BY fk.CONSTRAINT_NAME, fk.ORDINAL_POSITION
+    """
+    
+    fk_results, _ = await db.execute_query(fk_query)
+    
+    # Also look for primary key constraints
+    pk_query = f"""
+    SELECT 
+        CONSTRAINT_NAME,
+        COLUMN_NAME,
+        ORDINAL_POSITION
+    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+    WHERE TABLE_CATALOG = '{db_name}'
+        AND TABLE_SCHEMA = '{schema_name}'
+        AND TABLE_NAME = '{table}'
+        AND CONSTRAINT_NAME IN (
+            SELECT CONSTRAINT_NAME 
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+            WHERE TABLE_CATALOG = '{db_name}'
+                AND TABLE_SCHEMA = '{schema_name}'
+                AND TABLE_NAME = '{table}'
+                AND CONSTRAINT_TYPE = 'PRIMARY KEY'
+        )
+    ORDER BY ORDINAL_POSITION
+    """
+    
+    pk_results, _ = await db.execute_query(pk_query)
+    
+    # Process foreign key relationships
+    outgoing_fks = []  # This table references other tables
+    incoming_fks = []  # Other tables reference this table
+    
+    for row in fk_results:
+        if (row["FK_DATABASE"] == db_name and 
+            row["FK_SCHEMA"] == schema_name and 
+            row["FK_TABLE"] == table):
+            # Outgoing FK (this table references another)
+            outgoing_fks.append({
+                "constraint_name": row["CONSTRAINT_NAME"],
+                "from_column": row["FK_COLUMN"],
+                "to_table": f"{row['PK_DATABASE']}.{row['PK_SCHEMA']}.{row['PK_TABLE']}",
+                "to_column": row["PK_COLUMN"]
+            })
+        else:
+            # Incoming FK (another table references this)
+            incoming_fks.append({
+                "constraint_name": row["CONSTRAINT_NAME"],
+                "from_table": f"{row['FK_DATABASE']}.{row['FK_SCHEMA']}.{row['FK_TABLE']}",
+                "from_column": row["FK_COLUMN"],
+                "to_column": row["PK_COLUMN"]
+            })
+    
+    # Process primary keys
+    primary_keys = [row["COLUMN_NAME"] for row in pk_results]
+    
+    result = {
+        "table_name": table_name,
+        "primary_keys": primary_keys,
+        "foreign_keys": {
+            "outgoing": outgoing_fks,
+            "incoming": incoming_fks
+        },
+        "relationship_summary": {
+            "references_tables": len(set(fk["to_table"] for fk in outgoing_fks)),
+            "referenced_by_tables": len(set(fk["from_table"] for fk in incoming_fks)),
+            "total_relationships": len(outgoing_fks) + len(incoming_fks)
+        }
+    }
+    
+    return [types.TextContent(
+        type="text",
+        text=json.dumps(result, indent=2)
+    )]
+
+
+async def handle_cortex_analyst(arguments, db, _, __, server):
+    """Use Snowflake Cortex LLM functions to analyze data using natural language."""
+    if not arguments or "question" not in arguments:
+        raise ValueError("Missing 'question' parameter")
+    
+    question = arguments["question"]
+    model = arguments.get("model", "mistral-large2")
+    temperature = arguments.get("temperature", 0.0)
+    max_tokens = arguments.get("max_tokens", 4096)
+    context_tables = arguments.get("context_tables", [])
+    
+    # Build context from specified tables
+    context = ""
+    if context_tables:
+        context = "Database context:\n"
+        for table_name in context_tables[:5]:  # Limit to 5 tables to avoid token limits
+            try:
+                # Get table schema
+                desc_query = f"DESCRIBE TABLE {table_name}"
+                columns, _ = await db.execute_query(desc_query)
+                
+                context += f"\nTable: {table_name}\nColumns:\n"
+                for col in columns[:20]:  # Limit columns
+                    context += f"  - {col['name']}: {col['type']}"
+                    if col.get('comment'):
+                        context += f" ({col['comment']})"
+                    context += "\n"
+                
+                # Get sample data
+                sample_query = f"SELECT * FROM {table_name} LIMIT 3"
+                sample_data, _ = await db.execute_query(sample_query)
+                if sample_data:
+                    context += f"Sample data: {json.dumps(sample_data[:3], indent=2, default=data_json_serializer)}\n"
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get context for table {table_name}: {str(e)}")
+    
+    # Construct the prompt
+    prompt = f"""You are a SQL expert analyzing a Snowflake database. 
+{context}
+
+User question: {question}
+
+Please provide:
+1. A clear answer to the question
+2. The SQL query that would answer this question
+3. Any relevant insights or recommendations
+
+Format your response as JSON with keys: "answer", "sql_query", "insights"
+"""
+    
+    # Use CORTEX.COMPLETE function with structured output
+    cortex_query = f"""
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(
+        '{model}',
+        '{prompt.replace("'", "''")}',
+        {{
+            'temperature': {temperature},
+            'max_tokens': {max_tokens},
+            'response_format': {{
+                'type': 'json_object',
+                'schema': {{
+                    'type': 'object',
+                    'properties': {{
+                        'answer': {{'type': 'string'}},
+                        'sql_query': {{'type': 'string'}},
+                        'insights': {{'type': 'array', 'items': {{'type': 'string'}}}}
+                    }},
+                    'required': ['answer', 'sql_query']
+                }}
+            }}
+        }}
+    ) as response;
+    """
+    
+    try:
+        result, _ = await db.execute_query(cortex_query)
+        
+        if result and len(result) > 0:
+            response = json.loads(result[0]["RESPONSE"])
+            
+            # Format the output
+            output = {
+                "question": question,
+                "model": model,
+                "answer": response.get("answer", "No answer generated"),
+                "sql_query": response.get("sql_query"),
+                "insights": response.get("insights", []),
+                "query_results": None
+            }
+            
+            # Execute the generated SQL if requested
+            if arguments.get("execute_sql", True) and output["sql_query"]:
+                try:
+                    # Clean the SQL query
+                    sql_query = output["sql_query"].strip()
+                    if sql_query and not sql_query.endswith(';'):
+                        sql_query += ';'
+                    
+                    query_results, _ = await db.execute_query(sql_query)
+                    output["query_results"] = query_results
+                except Exception as e:
+                    output["query_error"] = str(e)
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(output, indent=2, default=data_json_serializer)
+            )]
+        else:
+            raise ValueError("No response received from Cortex")
+            
+    except Exception as e:
+        logger.error(f"Cortex query failed: {str(e)}")
+        
+        # Fallback to simpler approach without structured output
+        try:
+            simple_query = f"""
+            SELECT SNOWFLAKE.CORTEX.COMPLETE(
+                '{model}',
+                'User question: {question.replace("'", "''")}\\n\\nProvide a SQL query to answer this question and explain your approach.'
+            ) as response;
+            """
+            
+            result, _ = await db.execute_query(simple_query)
+            if result and len(result) > 0:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "question": question,
+                        "model": model,
+                        "response": result[0]["RESPONSE"],
+                        "note": "Using simplified Cortex response without structured output"
+                    }, indent=2)
+                )]
+        except Exception as fallback_error:
+            logger.error(f"Fallback query also failed: {str(fallback_error)}")
+        
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({
+                "error": "Cortex query failed",
+                "details": str(e),
+                "suggestion": "Ensure you have the SNOWFLAKE.CORTEX_USER role and Cortex is enabled for your account"
+            }, indent=2)
+        )]
+
+
+async def handle_get_data_summary(arguments, db, _, __, server):
+    """Get a summary of the data warehouse structure and statistics."""
+    include_schemas = arguments.get("include_schemas", True)
+    include_largest_tables = arguments.get("include_largest_tables", True)
+    include_recent_tables = arguments.get("include_recent_tables", True)
+    database_filter = arguments.get("database")  # Optional database filter
+    
+    results = {}
+    
+    # Get database statistics
+    db_query = "SELECT COUNT(DISTINCT TABLE_CATALOG) as database_count FROM INFORMATION_SCHEMA.TABLES"
+    if database_filter:
+        db_query += f" WHERE TABLE_CATALOG = '{database_filter}'"
+    
+    db_result, _ = await db.execute_query(db_query)
+    results["database_count"] = db_result[0]["DATABASE_COUNT"] if db_result else 0
+    
+    # Get schema statistics
+    if include_schemas:
+        schema_query = """
+        SELECT 
+            TABLE_CATALOG as DATABASE_NAME,
+            COUNT(DISTINCT TABLE_SCHEMA) as SCHEMA_COUNT,
+            COUNT(DISTINCT TABLE_NAME) as TABLE_COUNT,
+            SUM(ROW_COUNT) as TOTAL_ROWS,
+            SUM(BYTES) as TOTAL_BYTES
+        FROM INFORMATION_SCHEMA.TABLES
+        """
+        if database_filter:
+            schema_query += f" WHERE TABLE_CATALOG = '{database_filter}'"
+        schema_query += " GROUP BY TABLE_CATALOG ORDER BY TABLE_CATALOG"
+        
+        schema_results, _ = await db.execute_query(schema_query)
+        results["databases"] = [
+            {
+                "database": row["DATABASE_NAME"],
+                "schema_count": row["SCHEMA_COUNT"],
+                "table_count": row["TABLE_COUNT"],
+                "total_rows": row["TOTAL_ROWS"] or 0,
+                "total_bytes": row["TOTAL_BYTES"] or 0,
+                "total_gb": round((row["TOTAL_BYTES"] or 0) / (1024**3), 2)
+            }
+            for row in schema_results
+        ]
+    
+    # Get largest tables
+    if include_largest_tables:
+        largest_query = """
+        SELECT 
+            TABLE_CATALOG as DATABASE_NAME,
+            TABLE_SCHEMA as SCHEMA_NAME,
+            TABLE_NAME,
+            ROW_COUNT,
+            BYTES,
+            ROUND(BYTES / (1024*1024*1024), 2) as SIZE_GB
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE ROW_COUNT > 0
+        """
+        if database_filter:
+            largest_query += f" AND TABLE_CATALOG = '{database_filter}'"
+        largest_query += " ORDER BY BYTES DESC NULLS LAST LIMIT 10"
+        
+        largest_results, _ = await db.execute_query(largest_query)
+        results["largest_tables"] = [
+            {
+                "full_name": f"{row['DATABASE_NAME']}.{row['SCHEMA_NAME']}.{row['TABLE_NAME']}",
+                "row_count": row["ROW_COUNT"],
+                "size_bytes": row["BYTES"],
+                "size_gb": row["SIZE_GB"]
+            }
+            for row in largest_results
+        ]
+    
+    # Get recently created/modified tables
+    if include_recent_tables:
+        recent_query = """
+        SELECT 
+            TABLE_CATALOG as DATABASE_NAME,
+            TABLE_SCHEMA as SCHEMA_NAME,
+            TABLE_NAME,
+            CREATED,
+            LAST_ALTERED,
+            ROW_COUNT
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE CREATED IS NOT NULL
+        """
+        if database_filter:
+            recent_query += f" AND TABLE_CATALOG = '{database_filter}'"
+        recent_query += " ORDER BY GREATEST(CREATED, LAST_ALTERED) DESC LIMIT 10"
+        
+        recent_results, _ = await db.execute_query(recent_query)
+        results["recent_tables"] = [
+            {
+                "full_name": f"{row['DATABASE_NAME']}.{row['SCHEMA_NAME']}.{row['TABLE_NAME']}",
+                "created": str(row["CREATED"]) if row["CREATED"] else None,
+                "last_altered": str(row["LAST_ALTERED"]) if row["LAST_ALTERED"] else None,
+                "row_count": row["ROW_COUNT"] or 0
+            }
+            for row in recent_results
+        ]
+    
+    # Calculate summary statistics
+    if "databases" in results:
+        total_tables = sum(db["table_count"] for db in results["databases"])
+        total_rows = sum(db["total_rows"] for db in results["databases"])
+        total_gb = sum(db["total_gb"] for db in results["databases"])
+        
+        results["summary"] = {
+            "total_databases": len(results["databases"]),
+            "total_tables": total_tables,
+            "total_rows": total_rows,
+            "total_size_gb": round(total_gb, 2)
+        }
+    
+    return [types.TextContent(
+        type="text",
+        text=json.dumps(results, indent=2)
+    )]
+
+
+async def handle_append_insight(arguments, db, _, __, server):
+    if not arguments or "insight" not in arguments:
+        raise ValueError("Missing insight argument")
+
+    db.add_insight(arguments["insight"])
+    await server.request_context.session.send_resource_updated(AnyUrl("memo://insights"))
+    return [types.TextContent(type="text", text="Insight added to memo")]
+
+
+async def handle_write_query(arguments, db, _, allow_write, __):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if arguments["query"].strip().upper().startswith("SELECT"):
+        raise ValueError("SELECT queries are not allowed for write_query")
+
+    results, data_id = await db.execute_query(arguments["query"])
+    return [types.TextContent(type="text", text=str(results))]
+
+
+async def handle_create_table(arguments, db, _, allow_write, __):
+    if not allow_write:
+        raise ValueError("Write operations are not allowed for this data connection")
+    if not arguments["query"].strip().upper().startswith("CREATE TABLE"):
+        raise ValueError("Only CREATE TABLE statements are allowed")
+
+    results, data_id = await db.execute_query(arguments["query"])
+    return [types.TextContent(type="text", text=f"Table created successfully. data_id = {data_id}")]
+
+
+async def prefetch_tables(db: SnowflakeDB, credentials: dict) -> dict:
+    """Prefetch table and column information"""
+    try:
+        logger.info("Prefetching table descriptions")
+        table_results, data_id = await db.execute_query(
+            f"""SELECT table_name, comment 
+                FROM {credentials['database']}.information_schema.tables 
+                WHERE table_schema = '{credentials['schema'].upper()}'"""
+        )
+
+        column_results, data_id = await db.execute_query(
+            f"""SELECT table_name, column_name, data_type, comment 
+                FROM {credentials['database']}.information_schema.columns 
+                WHERE table_schema = '{credentials['schema'].upper()}'"""
+        )
+
+        tables_brief = {}
+        for row in table_results:
+            tables_brief[row["TABLE_NAME"]] = {**row, "COLUMNS": {}}
+
+        for row in column_results:
+            row_without_table_name = row.copy()
+            del row_without_table_name["TABLE_NAME"]
+            tables_brief[row["TABLE_NAME"]]["COLUMNS"][row["COLUMN_NAME"]] = row_without_table_name
+
+        return tables_brief
+
+    except Exception as e:
+        logger.error(f"Error prefetching table descriptions: {e}")
+        return f"Error prefetching table descriptions: {e}"
+
+
+# Authentication handlers
+async def handle_authenticate_snowflake(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """Authenticate with Snowflake using connection parameters"""
+    if not arguments:
+        raise ValueError("Missing connection parameters")
+    
+    required_params = ['account', 'user', 'password']
+    missing = [p for p in required_params if p not in arguments]
+    if missing:
+        raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+    
+    # Build connection parameters
+    connection_params = {
+        'account': arguments['account'],
+        'user': arguments['user'], 
+        'password': arguments['password']
+    }
+    
+    # Add optional parameters
+    optional_params = ['warehouse', 'database', 'schema', 'role']
+    for param in optional_params:
+        if param in arguments:
+            connection_params[param] = arguments[param]
+    
+    # Test authentication
+    auth_result = auth_client.test_authentication(connection_params)
+    
+    if not auth_result.get('valid', False):
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Authentication failed: {auth_result.get('error', 'Unknown error')}"
+            )
+        ]
+    
+    # Set credentials in auth client
+    auth_client.set_credentials(connection_params)
+    
+    # Save if requested
+    if arguments.get('save_credentials', True):
+        auth_client.storage.save_credentials(
+            connection_params['account'],
+            connection_params['user'],
+            connection_params
+        )
+    
+    # Create and initialize the database connection
+    # This is passed by reference from main()
+    new_db = SnowflakeDB(connection_params)
+    await new_db.start_init_connection()
+    
+    # Update the db reference in the main scope
+    # We'll need to pass this through kwargs
+    if 'db_setter' in kwargs:
+        kwargs['db_setter'](new_db)
+    
+    return [
+        types.TextContent(
+            type="text",
+            text=f"""Successfully authenticated to Snowflake:
+- Account: {auth_result['account']}
+- User: {auth_result['user']}
+- Role: {auth_result['role']}
+- Warehouse: {auth_result['warehouse']}
+- Credentials saved: {arguments.get('save_credentials', True)}"""
+        )
+    ]
+
+
+async def handle_use_saved_credentials(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """Use previously saved credentials"""
+    if not arguments or 'account' not in arguments or 'user' not in arguments:
+        raise ValueError("Missing required 'account' and 'user' parameters")
+    
+    connection_params = auth_client.storage.get_credentials(
+        arguments['account'],
+        arguments['user']
+    )
+    
+    if not connection_params:
+        return [
+            types.TextContent(
+                type="text",
+                text=f"No saved credentials found for account '{arguments['account']}' and user '{arguments['user']}'"
+            )
+        ]
+    
+    # Test that credentials still work
+    auth_result = auth_client.test_authentication(connection_params)
+    
+    if auth_result['valid']:
+        auth_client.set_credentials(connection_params)
+        
+        # Create and initialize the database connection
+        new_db = SnowflakeDB(connection_params)
+        await new_db.start_init_connection()
+        
+        # Update the db reference in the main scope
+        if 'db_setter' in kwargs:
+            kwargs['db_setter'](new_db)
+        
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Connected to Snowflake account '{arguments['account']}' as user '{arguments['user']}'"
+            )
+        ]
+    else:
+        return [
+            types.TextContent(
+                type="text",
+                text="Saved credentials are no longer valid. Please authenticate again."
+            )
+        ]
+
+
+async def handle_list_saved_credentials(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """List all saved credentials"""
+    saved = auth_client.storage.list_saved_credentials()
+    
+    if not saved:
+        return [
+            types.TextContent(
+                type="text",
+                text="No saved credentials found."
+            )
+        ]
+    
+    output = "Saved Snowflake credentials:\n\n"
+    for account, users in saved.items():
+        output += f"Account: {account}\n"
+        for user in users:
+            output += f"  - User: {user}\n"
+    
+    return [types.TextContent(type="text", text=output)]
+
+
+async def handle_delete_saved_credentials(arguments, db, _, __, server, auth_client=None, **kwargs):
+    """Delete saved credentials"""
+    account = arguments.get('account') if arguments else None
+    user = arguments.get('user') if arguments else None
+    
+    auth_client.storage.delete_credentials(account, user)
+    
+    if not account and not user:
+        message = "All saved credentials have been deleted."
+    elif account and user:
+        message = f"Deleted credentials for account '{account}' and user '{user}'."
+    elif account:
+        message = f"Deleted all credentials for account '{account}'."
+    else:
+        message = "Invalid parameters for credential deletion."
+    
+    return [types.TextContent(type="text", text=message)]
+
+
+async def main(
+    allow_write: bool = False,
+    connection_args: dict = None,
+    log_dir: str = None,
+    prefetch: bool = False,
+    log_level: str = "INFO",
+    exclude_tools: list[str] = [],
+    config_file: str = "runtime_config.json",
+    exclude_patterns: dict = None,
+    connection_config_file: str = "config.json",
+):
+    # Setup logging
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        logger.handlers.append(logging.FileHandler(os.path.join(log_dir, "mcp_snowflake_server.log")))
+    if log_level:
+        logger.setLevel(log_level)
+
+    logger.info("Starting Snowflake MCP Server")
+    logger.info("Allow write operations: %s", allow_write)
+    logger.info("Prefetch table descriptions: %s", prefetch)
+    logger.info("Excluded tools: %s", exclude_tools)
+
+    # Load configuration from file if provided
+    config = {}
+    #
+    if config_file:
+        try:
+            with open(config_file, "r") as f:
+                config = json.load(f)
+                logger.info(f"Loaded configuration from {config_file}")
+        except Exception as e:
+            logger.error(f"Error loading configuration file: {e}")
+
+    # Merge exclude_patterns from parameters with config file
+    exclusion_config = config.get("exclude_patterns", {})
+    if exclude_patterns:
+        # Merge patterns from parameters with those from config file
+        for key, patterns in exclude_patterns.items():
+            if key in exclusion_config:
+                exclusion_config[key].extend(patterns)
+            else:
+                exclusion_config[key] = patterns
+
+    # Set default patterns if none are specified
+    if not exclusion_config:
+        exclusion_config = {"databases": [], "schemas": [], "tables": []}
+
+    # Ensure all keys exist in the exclusion config
+    for key in ["databases", "schemas", "tables"]:
+        if key not in exclusion_config:
+            exclusion_config[key] = []
+
+    logger.info(f"Exclusion patterns: {exclusion_config}")
+
+    # Initialize authentication client
+    auth_client = SnowflakeAuthClient()
+    db = None
+    
+    # Create a reference holder for db that can be updated
+    db_ref = {'db': None}
+    
+    def set_db(new_db):
+        nonlocal db
+        db = new_db
+        db_ref['db'] = new_db
+    
+    # First, try to load connection config from file
+    connection_config = None
+    if connection_config_file and os.path.exists(connection_config_file):
+        try:
+            with open(connection_config_file, 'r') as f:
+                connection_config = json.load(f)
+                logger.info(f"Loaded connection configuration from {connection_config_file}")
+                # Merge with any command-line args
+                if connection_args:
+                    connection_config.update(connection_args)
+                connection_args = connection_config
+        except Exception as e:
+            logger.error(f"Error loading connection config file: {e}")
+    
+    # Check if we have pre-configured credentials
+    if connection_args and all(k in connection_args for k in ['account', 'user', 'password']):
+        # Use config-based authentication
+        logger.info("Using pre-configured authentication")
+        auth_client.set_credentials(connection_args)
+        db = SnowflakeDB(connection_args)
+        await db.start_init_connection()
+    else:
+        # Dynamic authentication mode
+        logger.info("Starting in dynamic authentication mode")
+        logger.info("No valid credentials found. Use 'authenticate_snowflake' tool to connect.")
+        # Create a placeholder DB that will be initialized after authentication
+        db = None
+    
+    server = Server("snowflake-manager")
+    write_detector = SQLWriteDetector()
+
+    tables_info = (await prefetch_tables(db, connection_args)) if (prefetch and db) else {}
+    tables_brief = data_to_yaml(tables_info) if (prefetch and db) else ""
+
+    all_tools = [
+        Tool(
+            name="list_databases",
+            description="List all available databases in Snowflake",
+            input_schema={
+                "type": "object",
+                "properties": {},
+            },
+            handler=handle_list_databases,
+        ),
+        Tool(
+            name="list_schemas",
+            description="List all schemas in a database",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Database name to list schemas from",
+                    },
+                },
+                "required": ["database"],
+            },
+            handler=handle_list_schemas,
+        ),
+        Tool(
+            name="list_tables",
+            description="List all tables in a specific database and schema",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {"type": "string", "description": "Database name"},
+                    "schema": {"type": "string", "description": "Schema name"},
+                },
+                "required": ["database", "schema"],
+            },
+            handler=handle_list_tables,
+        ),
+        Tool(
+            name="describe_table",
+            description="Get the schema information for a specific table",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "type": "string",
+                        "description": "Fully qualified table name in the format 'database.schema.table'",
+                    },
+                },
+                "required": ["table_name"],
+            },
+            handler=handle_describe_table,
+        ),
+        Tool(
+            name="profile_table",
+            description="Get statistical profile of a table including row count, column statistics, and sample values",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "type": "string",
+                        "description": "Fully qualified table name in the format 'database.schema.table'",
+                    },
+                },
+                "required": ["table_name"],
+            },
+            handler=handle_profile_table,
+        ),
+        Tool(
+            name="get_sample_data",
+            description="Get sample data from a table with various sampling options",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "type": "string",
+                        "description": "Fully qualified table name in the format 'database.schema.table'",
+                    },
+                    "sample_size": {
+                        "type": "integer",
+                        "description": "Number of rows to sample (default: 10)",
+                    },
+                    "sample_method": {
+                        "type": "string",
+                        "enum": ["top", "random", "bottom"],
+                        "description": "Sampling method: 'top' (first N rows), 'random' (random sample), 'bottom' (last N rows)",
+                    },
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of columns to include in the sample",
+                    },
+                },
+                "required": ["table_name"],
+            },
+            handler=handle_get_sample_data,
+        ),
+        Tool(
+            name="search_tables",
+            description="Search for tables by name pattern, column name, or comment",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "search_pattern": {
+                        "type": "string",
+                        "description": "Pattern to search for (supports % wildcards)",
+                    },
+                    "search_type": {
+                        "type": "string",
+                        "enum": ["table_name", "column_name", "comment"],
+                        "description": "Type of search: table name, column name, or table comment",
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Optional database name to limit search",
+                    },
+                    "schema": {
+                        "type": "string",
+                        "description": "Optional schema name to limit search",
+                    },
+                },
+                "required": ["search_pattern"],
+            },
+            handler=handle_search_tables,
+        ),
+        Tool(
+            name="get_table_relationships",
+            description="Get foreign key relationships and primary keys for a table",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "table_name": {
+                        "type": "string",
+                        "description": "Fully qualified table name in the format 'database.schema.table'",
+                    },
+                },
+                "required": ["table_name"],
+            },
+            handler=handle_get_table_relationships,
+        ),
+        Tool(
+            name="cortex_analyst",
+            description="Use Snowflake Cortex LLM to analyze data using natural language queries. This tool leverages AI to understand your questions, generate SQL queries, and provide insights about your data.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The natural language question to ask about your data (e.g., 'What were the top 5 products by revenue last quarter?')",
+                    },
+                    "context_tables": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of table names to provide as context (e.g., ['DB.SCHEMA.ORDERS', 'DB.SCHEMA.PRODUCTS']). The tool will include schema and sample data from these tables.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "The LLM model to use (default: 'mistral-large2'). Options include: 'mistral-large2', 'llama3.1-8b', 'llama3.1-70b', 'llama3.1-405b', 'gemini-1.5-flash', etc.",
+                        "default": "mistral-large2",
+                    },
+                    "execute_sql": {
+                        "type": "boolean",
+                        "description": "Whether to execute the generated SQL query and return results (default: true)",
+                        "default": True,
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "description": "Temperature for response generation (0.0-1.0, default: 0.0 for deterministic output)",
+                        "default": 0.0,
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Maximum tokens for the response (default: 4096)",
+                        "default": 4096,
+                    },
+                },
+                "required": ["question"],
+            },
+            handler=handle_cortex_analyst,
+        ),
+        Tool(
+            name="get_data_summary",
+            description="Get a summary of the data warehouse including database statistics, largest tables, and recent changes",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "database": {
+                        "type": "string",
+                        "description": "Optional database name to filter results",
+                    },
+                    "include_schemas": {
+                        "type": "boolean",
+                        "description": "Include schema statistics (default: true)",
+                    },
+                    "include_largest_tables": {
+                        "type": "boolean",
+                        "description": "Include list of largest tables (default: true)",
+                    },
+                    "include_recent_tables": {
+                        "type": "boolean",
+                        "description": "Include recently created/modified tables (default: true)",
+                    },
+                },
+            },
+            handler=handle_get_data_summary,
+        ),
+        Tool(
+            name="read_query",
+            description="Execute a SELECT query.",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "SELECT SQL query to execute"}},
+                "required": ["query"],
+            },
+            handler=handle_read_query,
+        ),
+        Tool(
+            name="append_insight",
+            description="Add a data insight to the memo",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "insight": {
+                        "type": "string",
+                        "description": "Data insight discovered from analysis",
+                    }
+                },
+                "required": ["insight"],
+            },
+            handler=handle_append_insight,
+            tags=["resource_based"],
+        ),
+        Tool(
+            name="write_query",
+            description="Execute an INSERT, UPDATE, or DELETE query on the Snowflake database",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "SQL query to execute"}},
+                "required": ["query"],
+            },
+            handler=handle_write_query,
+            tags=["write"],
+        ),
+        Tool(
+            name="create_table",
+            description="Create a new table in the Snowflake database",
+            input_schema={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "CREATE TABLE SQL statement"}},
+                "required": ["query"],
+            },
+            handler=handle_create_table,
+            tags=["write"],
+        ),
+    ]
+    
+    # Add authentication tools
+    auth_tools = [
+        Tool(
+            name="authenticate_snowflake",
+            description="Authenticate with Snowflake using connection parameters",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Snowflake account identifier (e.g., 'myorg-myaccount' or 'myaccount.region')"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Snowflake username"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Snowflake password"
+                    },
+                    "warehouse": {
+                        "type": "string",
+                        "description": "Warehouse to use (optional)"
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": "Default database (optional)"
+                    },
+                    "schema": {
+                        "type": "string",
+                        "description": "Default schema (optional)"
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Role to use (optional)"
+                    },
+                    "save_credentials": {
+                        "type": "boolean",
+                        "description": "Whether to save credentials for future use (default: true)",
+                        "default": True
+                    }
+                },
+                "required": ["account", "user", "password"]
+            },
+            handler=handle_authenticate_snowflake,
+            tags=["auth"]
+        ),
+        Tool(
+            name="use_saved_credentials",
+            description="Use previously saved Snowflake credentials",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Snowflake account identifier"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Snowflake username"
+                    }
+                },
+                "required": ["account", "user"]
+            },
+            handler=handle_use_saved_credentials,
+            tags=["auth"]
+        ),
+        Tool(
+            name="list_saved_credentials",
+            description="List all saved Snowflake credentials",
+            input_schema={
+                "type": "object",
+                "properties": {}
+            },
+            handler=handle_list_saved_credentials,
+            tags=["auth"]
+        ),
+        Tool(
+            name="delete_saved_credentials",
+            description="Delete saved Snowflake credentials",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "string",
+                        "description": "Snowflake account identifier (optional, deletes all if not specified)"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Snowflake username (optional)"
+                    }
+                }
+            },
+            handler=handle_delete_saved_credentials,
+            tags=["auth"]
+        )
+    ]
+    
+    # Combine all tools
+    all_tools = auth_tools + all_tools
+
+    exclude_tags = []
+    if not allow_write:
+        exclude_tags.append("write")
+    allowed_tools = [
+        tool for tool in all_tools if tool.name not in exclude_tools and not any(tag in exclude_tags for tag in tool.tags)
+    ]
+
+    logger.info("Allowed tools: %s", [tool.name for tool in allowed_tools])
+
+    # Register handlers
+    @server.list_resources()
+    async def handle_list_resources() -> list[types.Resource]:
+        resources = [
+            types.Resource(
+                uri=AnyUrl("snowflake://auth/status"),
+                name="Authentication Status",
+                description="Current Snowflake authentication status",
+                mimeType="text/plain",
+            ),
+            types.Resource(
+                uri=AnyUrl("memo://insights"),
+                name="Data Insights Memo",
+                description="A living document of discovered data insights",
+                mimeType="text/plain",
+            )
+        ]
+        table_brief_resources = [
+            types.Resource(
+                uri=AnyUrl(f"context://table/{table_name}"),
+                name=f"{table_name} table",
+                description=f"Description of the {table_name} table",
+                mimeType="text/plain",
+            )
+            for table_name in tables_info.keys()
+        ]
+        resources += table_brief_resources
+        return resources
+
+    @server.read_resource()
+    async def handle_read_resource(uri: AnyUrl) -> str:
+        if str(uri) == "snowflake://auth/status":
+            if auth_client.is_authenticated:
+                return f"""Authenticated to Snowflake:
+- Account: {auth_client.current_connection_params.get('account', 'N/A')}
+- User: {auth_client.current_connection_params.get('user', 'N/A')}
+- Warehouse: {auth_client.current_connection_params.get('warehouse', 'Default')}
+- Database: {auth_client.current_connection_params.get('database', 'Not set')}
+- Schema: {auth_client.current_connection_params.get('schema', 'Not set')}
+- Status: ✓ Connected"""
+            else:
+                saved = auth_client.storage.list_saved_credentials()
+                if saved:
+                    return f"""Not authenticated. Saved credentials available for:
+{json.dumps(saved, indent=2)}
+
+Use 'authenticate_snowflake' tool to connect."""
+                else:
+                    return """Not authenticated to Snowflake.
+
+Use 'authenticate_snowflake' tool with your credentials to connect."""
+        elif str(uri) == "memo://insights":
+            return db.get_memo() if db else "Database not initialized. Please authenticate first."
+        elif str(uri).startswith("context://table"):
+            table_name = str(uri).split("/")[-1]
+            if table_name in tables_info:
+                return data_to_yaml(tables_info[table_name])
+            else:
+                raise ValueError(f"Unknown table: {table_name}")
+        else:
+            raise ValueError(f"Unknown resource: {uri}")
+
+    @server.list_prompts()
+    async def handle_list_prompts() -> list[types.Prompt]:
+        return []
+
+    @server.get_prompt()
+    async def handle_get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
+        raise ValueError(f"Unknown prompt: {name}")
+
+    @server.call_tool()
+    @handle_tool_errors
+    async def handle_call_tool(
+        name: str, arguments: dict[str, Any] | None
+    ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        if name in exclude_tools:
+            return [types.TextContent(type="text", text=f"Tool {name} is excluded from this data connection")]
+
+        handler = next((tool.handler for tool in allowed_tools if tool.name == name), None)
+        if not handler:
+            raise ValueError(f"Unknown tool: {name}")
+
+        # Check if db is None for non-auth tools
+        if db is None and name not in ["authenticate_snowflake", "use_saved_credentials", "list_saved_credentials", "delete_saved_credentials"]:
+            return [types.TextContent(type="text", text="Not authenticated. Please use 'authenticate_snowflake' tool first.")]
+        
+        # Pass appropriate parameters based on tool type
+        if name in ["authenticate_snowflake", "use_saved_credentials", "list_saved_credentials", "delete_saved_credentials"]:
+            # Authentication tools
+            return await handler(
+                arguments,
+                db,
+                write_detector,
+                allow_write,
+                server,
+                auth_client=auth_client,
+                db_setter=set_db
+            )
+        elif name in ["list_databases", "list_schemas", "list_tables"]:
+            # Listing functions with exclusion config
+            return await handler(
+                arguments,
+                db,
+                write_detector,
+                allow_write,
+                server,
+                exclusion_config=exclusion_config,
+            )
+        else:
+            # Other tools
+            return await handler(arguments, db, write_detector, allow_write, server)
+
+    @server.list_tools()
+    async def handle_list_tools() -> list[types.Tool]:
+        logger.info("Listing tools")
+        logger.error(f"Allowed tools: {allowed_tools}")
+        tools = [
+            types.Tool(
+                name=tool.name,
+                description=tool.description,
+                inputSchema=tool.input_schema,
+            )
+            for tool in allowed_tools
+        ]
+        return tools
+
+    # Start server
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        logger.info("Server running with stdio transport")
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="snowflake",
+                server_version=importlib.metadata.version("mcp_snowflake_server"),
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
